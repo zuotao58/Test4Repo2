@@ -1,0 +1,333 @@
+#!/bin/bash
+
+usage(){
+local tools_name=$(basename $0)
+printf "
+Usage : ./${tools_name} [Options] PRODUCT  Actions
+
+    Options:
+      -l, -listp    : List the available project.
+          -h,  -help    : Print this message and exit.
+          -t, -tee      : Print log information on the standard-out.
+          -q, -quiet    : Don't print log information on the standard-out.
+          -j [N], cpu [N]
+                        : Allow N jobs to compile at once,you must add a space between Options and [N].
+          -m [MODULE]   : Only compile the [MODULE], you must add a space between Options and [MODULE].
+        
+    Actions:
+        -n, --new             : Clean and perform a full build.
+        -r, --remake          : retry perform a build.
+        -c, --copy_target     : copy target to release only.
+        -C, --copy_acuteag0     : copy acuteag code to alps dir
+      
+    Module:
+        -i, --image  <bootimage|systemimage|userdataimage|update-api|kernel|otapackage>
+            :Specify image to be build/re-build (bootimage|systemimage|userdataimage|recoveryimage).
+            :Specify module to be build/re-build (kernel|otapackage).
+
+    Project:
+        -p, --project  <packages/app/Email/>
+            :Specif Project pathdir to be build
+
+    Example:
+          ./${tools_name} -l
+                        : 列出可编译的产品id
+
+          ./${tools_name} [-v <user|eng|userdebug>] PRODUCT <-n|--new>
+                        : 编译产品 PRODUCT 的user or eng or userdebug 版本
+
+          ./${tools_name} PRODUCT -i <bootimage|systemimage|bootimage>
+                        : 编译产品PRODUCT 的bootimage | systemimage | bootimage. 还可以是kernel,otapackage等模块
+
+          ./${tools_name} GBW8901A01_A -p package/app/Email
+                        : 编译产品PRODUCT的一个apk.还可是以framework.jar等project.
+
+"
+}
+
+
+error(){
+    local ret="$1";shift
+    local info="$@"
+    if [ "$ret" -ne 0 ];then
+        echo "Error $ret: $info" >&2
+        exit $ret
+    fi
+}
+
+
+get_opts(){
+    argv="$@"
+    local build_variant=$(expr match  "$argv" '-opt=TARGET_BUILD_VARIANT=\(\w*\)')
+    if [ "$build_variant" == "user" -o "$build_variant" == "userdebug" -o  "$build_variant" == "eng" ];then
+        TARGET_BUILD_VARIANT=$build_variant
+        shift
+        echo $@
+    fi
+
+    opts=$(getopt -o cChi:lnp:ratv: --long copy_target,copy_acuteag,help,image:,listp,new,project:,remake,tee,target_build_variant:,clear_ccache -- "$@")     
+    if [ $? -ne 0 ];then
+        usage 
+        exit 1
+    fi
+    eval set -- "$opts"
+    while true 
+    do
+        case "$1" in 
+            -c|--copy_target)
+                COPY_TARGET=true
+                shift
+                ;;
+            -C|--copy_acuteag)
+                COPY_ACUTEAG=true
+                shift
+                ;;
+            -i|--image)
+                MODULE=$2
+                shift 2
+                ;;
+            -n|--new)
+                ACTION=new
+                shift
+                ;;
+            -p|--project)
+                PROJECT_PATH=$2
+                shift 2
+                ;;
+            -r|--remake)
+                ACTION=remake
+                shift 
+                ;;
+            -a|--android)
+                ACTION=android
+                shift 
+                ;;
+            -v|--target_build_variant)
+                TARGET_BUILD_VARIANT=$2
+                shift 2
+                ;;
+            -t|--tee)
+               	DEBUG="-d" 
+                shift 
+                ;;
+            -l|--listp)
+                perl build/tools/listP.pl
+                shift 
+                exit 0
+                ;;
+            --clear_ccache)
+                export AA_CLEAN_CCACHE="true"
+                shift 
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$ACTION" -a -z "$MODULE" -a -z "$PROJECT_PATH" -a -z "$COPY_TARGET" -a -z "$COPY_ACUTEAG" ];then
+        echo "Error 1: Specify action to be build/re-build"
+        usage
+        exit 1
+    fi
+
+    ACUTEAGPRODUCTID=${@}
+    if [ ! -d "device/qcom/${@}" ];then
+        echo "Error 2: *********** product directory not exist! ***********"
+        exit 2
+    fi
+
+    if  [ -n "$PROJECT_PATH" -a ! -d "$PROJECT_PATH" ];then
+        echo "Error 3: ***********$PROJECT_PATH not exist ************"
+        exit 3
+    fi
+}
+
+export_variable_from(){
+    local file=$1
+    if [ -e "$file" ];then
+        while read line
+        do
+            #去掉空行，'#'开头，含有':=',不含有'='的行
+            [ -z "$line" -o "${line:0:1}" == "#" ] && continue
+            [ -z "$(expr match "$line" '.*\(=\).*')" ] && continue
+            [ -n "$(expr match "$line" '.*\(:=\).*')" ] && continue
+            [ -n "$(expr match "$line" '.*\(+=\).*')" ] && continue
+            local key=`echo ${line%=*}`
+            local value=`echo ${line#*=}`
+            export "${key}"="${value}"
+        done < $file
+    else
+        echo "$file not exist"
+    fi
+}
+
+
+get_time() {
+    time=`date -Iseconds`
+    time=${time%+0800}
+    time=${time//-/}
+    time=${time//:/}
+    time=${time//T/}
+    time=${time:0:(${#time}-2)}
+    echo $time
+}
+
+
+copy_to_alps(){
+    sourcedir="$1"
+    destdir="$2"
+    if [ -d "$sourcedir" ];then
+        echo "copy $sourcedir to  $destdir "
+        pushd $sourcedir >/dev/null
+        find . -path "*\.git" -prune -o -path "./aa_project" -prune -o -type f -follow -print | cpio -pdmu --quiet $destdir
+        popd >/dev/null
+    fi
+}
+
+prebuild(){
+    AA_PROJECT=$ACUTEAGPRODUCTID
+    TARGET_PRODUCT=`grep  -w 'PRODUCT_NAME' device/qcom/${ACUTEAGPRODUCTID}/${ACUTEAGPRODUCTID}.mk | sed 's/ //g' | grep '^PRODUCT_NAME' | awk -F= '{print $2}'`
+    export TARGET_PRODUCT AA_PROJECT ACUTEAGPRODUCTID
+
+    if [ -f vendor/acuteangle/aa_project/${ACUTEAGPRODUCTID}.mk ];then
+        export_variable_from "vendor/acuteangle/aa_project/${ACUTEAGPRODUCTID}.mk"
+    fi
+
+    mkdir -p $LOGPATH
+}
+
+build_copy_aa_code(){
+
+    copy_to_alps "./acuteag" "${AA_BUILD_ROOT_DIR}"
+}
+
+build_android(){
+    $BUILD_TOOLS --build_variant $TARGET_BUILD_VARIANT --build_android $TARGET_PRODUCT --log_file $LOGPATH/$TARGET_PRODUCT-android
+    error "$?" "************ build_android ************"
+}
+
+build_update_api(){
+    $BUILD_TOOLS  --build_variant $TARGET_BUILD_VARIANT --update-api $TARGET_PRODUCT --log_file $LOGPATH/$TARGET_PRODUCT-update-api
+    error "$?" "*********** build_update_api ************"
+}
+
+build_clean(){
+    $BUILD_TOOLS --build_variant $TARGET_BUILD_VARIANT --clean_build $TARGET_PRODUCT --log_file $LOGPATH/$TARGET_PRODUCT-clean
+    error "$?" "*********** build_clean *************"
+}
+
+build_module(){
+    local image=$1
+    if `echo  "systemimage bootimage userdataimage" | grep -qw "$image" `;then
+        $BUILD_TOOLS --build_variant $TARGET_BUILD_VARIANT --image $image  $TARGET_PRODUCT --log_file $LOGPATH/$TARGET_PRODUCT-$image
+    else
+        $BUILD_TOOLS --build_variant $TARGET_BUILD_VARIANT --module $image  $TARGET_PRODUCT --log_file $LOGPATH/$TARGET_PRODUCT-$image  --debug
+    fi
+    error "$?" "************ build_$image ************"
+}
+
+build_project(){
+    local project_path=$1
+    $BUILD_TOOLS --build_variant $TARGET_BUILD_VARIANT --project $PROJECT_PATH  $TARGET_PRODUCT  --log_file $LOGPATH/$TARGET_PRODUCT-mmm
+    error "$?" "*********** build_project ************"
+}
+
+
+
+get_release_version(){
+    AA_RO_AA_AAZNVERNUMBER=`cat vendor/acuteangle/aa_project/${AAPROJECTID}_Release_Number`
+    echo "VERSION:"${AA_RO_AA_AAZNVERNUMBER}
+    AA_RELEASE_DIR="release/$AA_RO_AA_AAZNVERNUMBER"
+
+    AA_RELEASE_OTA_DIR_ROOT=${AA_RELEASE_DIR}
+    AA_RELEASE_IMG_DIR=${AA_RELEASE_DIR}_IMG
+    AA_RELEASE_OTA_TMP_DIR=${AA_RELEASE_OTA_DIR_ROOT}
+    AA_RELEASE_OTA_DIR=${AA_RELEASE_OTA_DIR_ROOT}
+}
+
+
+
+copy_results_to_release(){
+    echo "copy_results_to_release"
+}
+
+
+build_copy_target(){
+    get_release_version
+    copy_results_to_release
+    error "$?" "*********** build_copy_target **********"
+
+}
+
+build_remake(){
+    build_update_api
+    build_android
+    build_copy_target
+}
+
+build_new(){
+    build_clean
+    build_remake
+}
+
+
+main(){
+   get_opts "$@"
+
+   prebuild
+
+   if [ -n "$COPY_ACUTEAG" ];then
+       echo "********* BUILD COPY AACODE *******"
+       #build_copy_aa_code
+   fi
+
+
+   if [ -n "$ACTION" ];then
+       echo "********* BUILD $ACTION *********"
+       build_$ACTION
+   fi
+
+   if [ -n "$MODULE" ];then
+       echo "********* BUILD $MODULE*********"
+       build_module $MODULE
+   fi
+
+   if [ -d "$PROJECT_PATH" ];then
+       echo "********* BUILD $PROJECT_PATH *********"
+       build_project $PROJECT_PATH
+   fi
+
+   if [ -n "$COPY_TARGET" -o "$MODULE" == "otapackage" ];then
+       echo "********* BUILD COPY TARGET *********"
+       build_copy_target
+   fi
+
+}
+
+MODULE=""
+
+ACTION=""
+
+SHOWLOG=false
+
+AA_BUILD_ROOT_DIR=$(cd `dirname $0`; pwd)
+
+export AA_BUILD_ROOT_DIR
+
+TARGET_BUILD_VARIANT="eng"
+
+BUILD_TOOLS="$AA_BUILD_ROOT_DIR/build.sh $DEBUG --setup_ccache=true"
+
+LOGPATH="BUILDING_LOG"
+
+main "$@"
